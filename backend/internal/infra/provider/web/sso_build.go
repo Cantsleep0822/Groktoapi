@@ -1,0 +1,579 @@
+package web
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"golang.org/x/net/html"
+)
+
+const (
+	ssoBuildClientID = "b1a00492-073a-47ea-816f-4c329264a828"
+	ssoBuildScope    = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write"
+	ssoDeviceURL     = "https://auth.x.ai/oauth2/device/code"
+	ssoVerifyURL     = "https://auth.x.ai/oauth2/device/verify"
+	ssoApproveURL    = "https://auth.x.ai/oauth2/device/approve"
+	ssoTokenURL      = "https://auth.x.ai/oauth2/token"
+	maxAuthBody      = 2 << 20
+)
+
+type ssoBuildHTTPClient interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+type ssoBuildFlow struct {
+	client    ssoBuildHTTPClient
+	userAgent string
+	cookies   map[string]string
+}
+
+func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
+	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
+		return provider.CredentialSeed{}, fmt.Errorf("仅 Grok Web SSO 账号支持转换")
+	}
+	token, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("解密 Grok Web SSO: %w", err)
+	}
+	token = normalizeSSOToken(token)
+	if token == "" {
+		return provider.CredentialSeed{}, provider.ErrUnauthorized
+	}
+	lease, err := a.egress.AcquireCredential(ctx, egressdomain.ScopeWeb, credential)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	defer lease.Release()
+	requestCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	flow := &ssoBuildFlow{
+		client: lease, userAgent: lease.UserAgent,
+		cookies: ssoBuildCookies(token, lease.CFCookies),
+	}
+	seed, err := flow.convert(requestCtx, credential)
+	if err != nil {
+		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, conversionStatus(err), err)
+		return provider.CredentialSeed{}, err
+	}
+	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+	return seed, nil
+}
+
+func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
+	form := url.Values{"client_id": {ssoBuildClientID}, "scope": {ssoBuildScope}}
+	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	if status < 200 || status >= 300 {
+		return provider.CredentialSeed{}, fmt.Errorf("xAI Device Flow 启动失败: %w", conversionHTTPError{status: status})
+	}
+	var device struct {
+		DeviceCode string `json:"device_code"`
+		UserCode   string `json:"user_code"`
+		Interval   int    `json:"interval"`
+		ExpiresIn  int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &device); err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("解析 xAI Device Flow: %w", err)
+	}
+	if device.DeviceCode == "" || device.UserCode == "" {
+		return provider.CredentialSeed{}, fmt.Errorf("xAI Device Flow 返回字段不完整")
+	}
+	if device.Interval <= 0 {
+		device.Interval = 5
+	}
+	if device.ExpiresIn <= 0 {
+		device.ExpiresIn = 1800
+	}
+
+	// verify → consent。xAI 2025-09 起在 device 授权流程加入防伪令牌：consent 页面内嵌一个
+	// 一次性 consent_token（ES256 JWT，typ=consent+jwt），approve 必须回传它，否则返回
+	// 403「Request could not be verified」。因此这里不能只看 3xx 的状态路径，还要取到
+	// consent 页面来解析该令牌。
+	status, finalURL, verifyBody, err := f.doWithFollow(ctx, http.MethodPost, ssoVerifyURL, url.Values{"user_code": {device.UserCode}}, false)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	if status == http.StatusUnauthorized {
+		return provider.CredentialSeed{}, provider.ErrUnauthorized
+	}
+	if status < 200 || status >= 400 {
+		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败: %w", conversionHTTPError{status: status})
+	}
+	if redirectState := ssoDeviceRedirectState(finalURL); redirectState != "consent" {
+		if redirectState == "sign-in" {
+			return provider.CredentialSeed{}, provider.ErrUnauthorized
+		}
+		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败")
+	}
+	consentPageURL := finalURL
+
+	// verify 以 3xx 跳转到 consent 时响应体为空，需要 GET consent 页面本身来解析 consent_token。
+	consentToken := extractConsentToken(verifyBody)
+	consentUserCode := extractConsentInput(verifyBody, "user_code")
+	if consentToken == "" {
+		consentStatus, _, consentBody, cerr := f.do(ctx, http.MethodGet, consentPageURL, nil)
+		if cerr != nil {
+			return provider.CredentialSeed{}, fmt.Errorf("获取 xAI consent 页面失败: %w", cerr)
+		}
+		if consentStatus < 200 || consentStatus >= 300 {
+			return provider.CredentialSeed{}, fmt.Errorf("获取 xAI consent 页面失败: %w", conversionHTTPError{status: consentStatus})
+		}
+		consentToken = extractConsentToken(consentBody)
+		consentUserCode = extractConsentInput(consentBody, "user_code")
+	}
+	if !consentTokenMatchesDevice(consentToken, device.DeviceCode) && !consentTokenMatchesUserCode(consentToken, consentUserCode, device.UserCode, time.Now()) {
+		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败：未获取 consent_token")
+	}
+
+	status, finalURL, approveBody, err := f.doWithFollowHeaders(ctx, http.MethodPost, ssoApproveURL, url.Values{
+		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {""},
+		"consent_token": {consentToken},
+	}, false, map[string]string{
+		"Origin":                    "https://accounts.x.ai",
+		"Referer":                   consentPageURL,
+		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Sec-Fetch-Dest":            "document",
+		"Sec-Fetch-Mode":            "navigate",
+		"Sec-Fetch-Site":            "same-site",
+		"Sec-Fetch-User":            "?1",
+		"Upgrade-Insecure-Requests": "1",
+	})
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	if status == http.StatusForbidden && isBrowserVerificationRequired(approveBody) {
+		// Observed 2026-10-20: approve now demands a Castle browser token that only
+		// the consent page's script can produce. Not an SSO failure.
+		return provider.CredentialSeed{}, fmt.Errorf("%w: xAI 要求浏览器校验后才能批准授权，请改用 Device OAuth 在浏览器中手动完成", errBrowserVerificationRequired)
+	}
+	if status < 200 || status >= 400 {
+		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败: %w", conversionHTTPError{status: status})
+	}
+	if redirectState := ssoDeviceRedirectState(finalURL); redirectState != "done" {
+		if redirectState == "sign-in" {
+			return provider.CredentialSeed{}, provider.ErrUnauthorized
+		}
+		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败")
+	}
+
+	token, err := f.pollToken(ctx, device.DeviceCode, time.Duration(device.Interval)*time.Second, time.Duration(device.ExpiresIn)*time.Second)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	claims := decodeBuildClaims(firstValue(token.IDToken, token.AccessToken))
+	userID := claimString(claims, "sub")
+	email := claimString(claims, "email")
+	teamID := claimString(claims, "team_id")
+	name := strings.TrimSpace(credential.Name)
+	if name == "" {
+		name = "Grok Web account"
+	}
+	return provider.CredentialSeed{
+		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth,
+		Name: firstValue(email, name+" Build", userID, "Grok Build account"), Email: email, UserID: userID, TeamID: teamID,
+		SourceKey: "sso-build:" + security.HashToken(token.AccessToken), OIDCClientID: ssoBuildClientID,
+		AccessToken: token.AccessToken, RefreshToken: token.RefreshToken, ExpiresAt: token.ExpiresAt,
+	}, nil
+}
+
+type ssoBuildToken struct {
+	AccessToken  string
+	RefreshToken string
+	IDToken      string
+	ExpiresAt    time.Time
+}
+
+func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interval, expiresIn time.Duration) (ssoBuildToken, error) {
+	if interval < time.Second {
+		interval = time.Second
+	}
+	deadline := time.Now().Add(min(expiresIn, 75*time.Second))
+	for time.Now().Before(deadline) {
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ssoBuildToken{}, ctx.Err()
+		case <-timer.C:
+		}
+		status, _, body, err := f.do(ctx, http.MethodPost, ssoTokenURL, url.Values{
+			"grant_type": {"urn:ietf:params:oauth:grant-type:device_code"}, "client_id": {ssoBuildClientID}, "device_code": {deviceCode},
+		})
+		if err != nil {
+			return ssoBuildToken{}, err
+		}
+		var payload struct {
+			AccessToken      string `json:"access_token"`
+			RefreshToken     string `json:"refresh_token"`
+			IDToken          string `json:"id_token"`
+			ExpiresIn        int    `json:"expires_in"`
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return ssoBuildToken{}, fmt.Errorf("解析 xAI OAuth Token: %w", err)
+		}
+		if status >= 200 && status < 300 && payload.AccessToken != "" {
+			if payload.ExpiresIn <= 0 {
+				payload.ExpiresIn = 3600
+			}
+			return ssoBuildToken{AccessToken: payload.AccessToken, RefreshToken: payload.RefreshToken, IDToken: payload.IDToken, ExpiresAt: time.Now().UTC().Add(time.Duration(payload.ExpiresIn) * time.Second)}, nil
+		}
+		switch payload.Error {
+		case "authorization_pending":
+			continue
+		case "slow_down":
+			interval += 5 * time.Second
+			continue
+		case "access_denied", "expired_token":
+			return ssoBuildToken{}, provider.ErrAuthorizationDenied
+		default:
+			if status >= 400 {
+				return ssoBuildToken{}, fmt.Errorf("xAI OAuth Token 失败 (%s): %w", firstValue(payload.ErrorDescription, payload.Error), conversionHTTPError{status: status})
+			}
+			return ssoBuildToken{}, fmt.Errorf("xAI OAuth Token 失败: %s", firstValue(payload.ErrorDescription, payload.Error, strconv.Itoa(status)))
+		}
+	}
+	return ssoBuildToken{}, fmt.Errorf("xAI Device Flow 轮询超时")
+}
+
+func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url.Values) (int, string, []byte, error) {
+	return f.doWithFollow(ctx, method, endpoint, form, true)
+}
+
+// doWithFollow 在 follow=false 时遇到 3xx 直接返回状态码与解析后的 Location 作为 finalURL，
+// 用于重定向目标域会被 Cloudflare 拦截（accounts.x.ai）的请求。
+func (f *ssoBuildFlow) doWithFollow(ctx context.Context, method, endpoint string, form url.Values, follow bool) (int, string, []byte, error) {
+	return f.doWithFollowHeaders(ctx, method, endpoint, form, follow, nil)
+}
+
+func (f *ssoBuildFlow) doWithFollowHeaders(ctx context.Context, method, endpoint string, form url.Values, follow bool, extraHeaders map[string]string) (int, string, []byte, error) {
+	if !safeXAIURL(endpoint) {
+		return 0, "", nil, fmt.Errorf("xAI OAuth URL 不安全")
+	}
+	currentURL := endpoint
+	currentMethod := method
+	currentForm := form
+	for redirects := 0; redirects <= 8; redirects++ {
+		var body io.Reader
+		if currentForm != nil {
+			body = strings.NewReader(currentForm.Encode())
+		}
+		request, err := http.NewRequestWithContext(ctx, currentMethod, currentURL, body)
+		if err != nil {
+			return 0, "", nil, err
+		}
+		request.Header.Set("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
+		request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+		request.Header.Set("User-Agent", f.userAgent)
+		request.Header.Set("Cookie", f.cookieHeader())
+		if currentMethod == http.MethodGet && ssoDeviceRedirectState(currentURL) == "consent" {
+			request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+			request.Header.Set("Referer", "https://auth.x.ai/")
+			request.Header.Set("Sec-Fetch-Dest", "document")
+			request.Header.Set("Sec-Fetch-Mode", "navigate")
+			request.Header.Set("Sec-Fetch-Site", "same-site")
+			request.Header.Set("Upgrade-Insecure-Requests", "1")
+		}
+		for key, value := range extraHeaders {
+			request.Header.Set(key, value)
+		}
+		if currentForm != nil {
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		response, err := f.client.Do(request)
+		if err != nil {
+			return 0, "", nil, err
+		}
+		f.captureCookies(response)
+		data, readErr := io.ReadAll(io.LimitReader(response.Body, maxAuthBody+1))
+		_ = response.Body.Close()
+		if readErr != nil {
+			return response.StatusCode, currentURL, nil, readErr
+		}
+		if len(data) > maxAuthBody {
+			return response.StatusCode, currentURL, nil, fmt.Errorf("xAI OAuth 响应超过 2 MiB")
+		}
+		if response.StatusCode < 300 || response.StatusCode > 399 {
+			return response.StatusCode, currentURL, data, nil
+		}
+		location := strings.TrimSpace(response.Header.Get("Location"))
+		if location == "" {
+			return response.StatusCode, currentURL, data, fmt.Errorf("xAI OAuth 重定向缺少 Location")
+		}
+		base, _ := url.Parse(currentURL)
+		next, err := url.Parse(location)
+		if err != nil {
+			return response.StatusCode, currentURL, data, err
+		}
+		currentURL = base.ResolveReference(next).String()
+		if !safeXAIURL(currentURL) {
+			return response.StatusCode, currentURL, data, fmt.Errorf("xAI OAuth 重定向到非受信域名")
+		}
+		if !follow {
+			return response.StatusCode, currentURL, data, nil
+		}
+		if response.StatusCode == http.StatusSeeOther || ((response.StatusCode == http.StatusMovedPermanently || response.StatusCode == http.StatusFound) && currentMethod != http.MethodGet && currentMethod != http.MethodHead) {
+			currentMethod = http.MethodGet
+			currentForm = nil
+		}
+	}
+	return 0, currentURL, nil, fmt.Errorf("xAI OAuth 重定向次数过多")
+}
+
+func (f *ssoBuildFlow) captureCookies(response *http.Response) {
+	for _, cookie := range response.Cookies() {
+		name := strings.TrimSpace(cookie.Name)
+		value := strings.TrimSpace(cookie.Value)
+		if name == "" || len(name) > 128 || len(value) > 16384 || strings.ContainsAny(name+value, "\r\n\x00") {
+			continue
+		}
+		if cookie.MaxAge < 0 {
+			delete(f.cookies, name)
+			continue
+		}
+		f.cookies[name] = value
+	}
+}
+
+func ssoDeviceRedirectState(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || !safeXAIURL(raw) {
+		return ""
+	}
+	path := strings.TrimRight(parsed.EscapedPath(), "/")
+	switch path {
+	case "/oauth2/device/consent":
+		return "consent"
+	case "/oauth2/device/done":
+		return "done"
+	case "/sign-in", "/sign-up":
+		return "sign-in"
+	default:
+		return ""
+	}
+}
+
+func (f *ssoBuildFlow) cookieHeader() string {
+	keys := make([]string, 0, len(f.cookies))
+	for key := range f.cookies {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+f.cookies[key])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func ssoBuildCookies(token, cloudflareCookies string) map[string]string {
+	cookies := make(map[string]string)
+	for _, part := range strings.Split(infraegress.BuildSSOCookie(token, cloudflareCookies), ";") {
+		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && name != "" {
+			cookies[name] = value
+		}
+	}
+	return cookies
+}
+
+func safeXAIURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "x.ai" || strings.HasSuffix(host, ".x.ai")
+}
+
+func normalizeSSOToken(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(strings.ToLower(value), "sso=") {
+		value = strings.TrimSpace(value[len("sso="):])
+	}
+	if token, _, found := strings.Cut(value, ";"); found {
+		value = strings.TrimSpace(token)
+	}
+	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
+}
+
+var (
+	consentTokenJSONRe = regexp.MustCompile(`(?i)\\?["']?(?:consentToken|consent_token)\\?["']?\s*[:=]\s*\\?["'](eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\\?["']`)
+)
+
+// extractConsentToken 从 consent 页面 HTML 中解析一次性 consent_token：
+// 优先取表单隐藏字段 name="consent_token"，回退到 RSC/JSON 里的 consentToken。
+func extractConsentToken(body []byte) string {
+	tokenizer := html.NewTokenizer(strings.NewReader(string(body)))
+	for {
+		tokenType := tokenizer.Next()
+		if tokenType == html.ErrorToken {
+			break
+		}
+		if tokenType != html.StartTagToken && tokenType != html.SelfClosingTagToken {
+			continue
+		}
+		token := tokenizer.Token()
+		if !strings.EqualFold(token.Data, "input") {
+			continue
+		}
+		var name, value string
+		for _, attribute := range token.Attr {
+			switch strings.ToLower(attribute.Key) {
+			case "name":
+				name = attribute.Val
+			case "value":
+				value = attribute.Val
+			}
+		}
+		if strings.EqualFold(name, "consent_token") && value != "" {
+			return value
+		}
+	}
+	if m := consentTokenJSONRe.FindSubmatch(body); m != nil {
+		return string(m[1])
+	}
+	return ""
+}
+
+// consentTokenMatchesUserCode binds a consent token to this device request
+// when its dc claim is a server-side authorization id (observed 2026-10-20:
+// a UUID unrelated to device_code). The consent form echoes our user_code, so
+// the token is accepted only from that form, with the consent audience and an
+// unexpired exp.
+func consentTokenMatchesUserCode(token, pageUserCode, userCode string, now time.Time) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] == "" || parts[2] == "" || userCode == "" || !strings.EqualFold(strings.TrimSpace(pageUserCode), userCode) {
+		return false
+	}
+	header, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	var head struct {
+		Typ string `json:"typ"`
+	}
+	if json.Unmarshal(header, &head) != nil || !strings.EqualFold(head.Typ, "consent+jwt") {
+		return false
+	}
+	claims := decodeBuildClaims(token)
+	if claimString(claims, "aud") != "consent" || claimString(claims, "dc") == "" {
+		return false
+	}
+	exp, _ := claims["exp"].(float64)
+	return exp > 0 && time.Unix(int64(exp), 0).After(now)
+}
+
+// extractConsentInput returns the value of a hidden input on the consent form.
+func extractConsentInput(body []byte, field string) string {
+	tokenizer := html.NewTokenizer(strings.NewReader(string(body)))
+	for {
+		tokenType := tokenizer.Next()
+		if tokenType == html.ErrorToken {
+			return ""
+		}
+		if tokenType != html.StartTagToken && tokenType != html.SelfClosingTagToken {
+			continue
+		}
+		token := tokenizer.Token()
+		if !strings.EqualFold(token.Data, "input") {
+			continue
+		}
+		var name, value string
+		for _, attribute := range token.Attr {
+			switch strings.ToLower(attribute.Key) {
+			case "name":
+				name = attribute.Val
+			case "value":
+				value = attribute.Val
+			}
+		}
+		if strings.EqualFold(name, field) {
+			return value
+		}
+	}
+}
+
+func consentTokenMatchesDevice(token, deviceCode string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] == "" || parts[2] == "" {
+		return false
+	}
+	return claimString(decodeBuildClaims(token), "dc") == deviceCode && deviceCode != ""
+}
+
+func decodeBuildClaims(token string) map[string]any {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]any
+	if json.Unmarshal(data, &claims) != nil {
+		return nil
+	}
+	return claims
+}
+
+func claimString(claims map[string]any, key string) string {
+	value, _ := claims[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func firstValue(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// errBrowserVerificationRequired reports that xAI refused the automated
+// device approval because it requires an interactive browser check.
+var errBrowserVerificationRequired = errors.New("xAI device approval requires browser verification")
+
+func isBrowserVerificationRequired(body []byte) bool {
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "could not verify this browser") || strings.Contains(text, "request could not be verified")
+}
+
+type conversionHTTPError struct{ status int }
+
+func (e conversionHTTPError) Error() string { return fmt.Sprintf("xAI OAuth HTTP %d", e.status) }
+
+func conversionStatus(err error) int {
+	var statusErr conversionHTTPError
+	if errors.As(err, &statusErr) {
+		return statusErr.status
+	}
+	if errors.Is(err, provider.ErrUnauthorized) {
+		return http.StatusUnauthorized
+	}
+	return 0
+}
+
+var _ provider.BuildCredentialConverter = (*Adapter)(nil)
+var _ ssoBuildHTTPClient = (*infraegress.Lease)(nil)
